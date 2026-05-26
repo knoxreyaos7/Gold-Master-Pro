@@ -1492,19 +1492,34 @@ const strategy = {
   },
 
   // ── MITIGATION CHECKER ──
+  // A zone is invalid if:
+  //   (a) price CLOSED through it (hard close-out), OR
+  //   (b) price has ENTERED the zone 2+ separate times (fully consumed)
+  // Each distinct visit (price exits & re-enters) counts as one additional touch.
   isMitigated(zone, tf, dir) {
-    if (!zone || !zone.epoch) return true; // no epoch = can't verify = treat as mitigated/invalid
+    if (!zone || !zone.epoch) return true;
     const arr = candles[tf];
     if (!arr || arr.length < 2) return false;
     const formIdx = arr.findIndex(c => c.epoch === zone.epoch);
     if (formIdx === -1 || formIdx >= arr.length - 1) return false;
+
+    let touches = 0;
+    let wasInZone = false;
+
     for (let i = formIdx + 1; i < arr.length; i++) {
-      if (dir === 'bull') {
-        // Bullish zone invalidated when price closes below zone low
-        if (arr[i].close < zone.low) return true;
-      } else {
-        // Bearish zone invalidated when price closes above zone high
-        if (arr[i].close > zone.high) return true;
+      const c = arr[i];
+      // Hard mitigation — price closed beyond zone boundary
+      if (dir === 'bull' && c.close < zone.low) return true;
+      if (dir === 'bear' && c.close > zone.high) return true;
+
+      // Touch counting — candle wick/body entered the zone
+      const inZone = c.low <= zone.high && c.high >= zone.low;
+      if (inZone && !wasInZone) {
+        touches++;
+        wasInZone = true;
+        if (touches >= 2) return true; // zone fully consumed after 2 visits
+      } else if (!inZone) {
+        wasInZone = false;
       }
     }
     return false;
@@ -2174,16 +2189,18 @@ const strategy = {
     // ── STEP 2: M5 structural gate (pass M1 score for strong-setup bypass) ──
     const htf = this.htfConflCheck('UP', score);
 
-    // ── STEP 3: M1 entry zone check (20–50% FVG/OB fills = mean threshold entries) ──
+    // ── STEP 3: M1 entry zone — price must be 20–50% INTO OB/FVG from the entry side ──
+    // For bullish: OB bottom is the entry side. 20-50% penetration = ob.low+20% to ob.low+50%.
+    // No score bypass — price MUST be in zone to enter (prevents wide-SL entries far from zone).
     let inOBZone = false, inFVGZone = false;
     if (ob) {
-      let zone;
-      if      (score >= 9)  zone = this.entryZone(ob, 0.20, 0.80); // HQ: full CE band
-      else if (score >= 6)  zone = this.entryZone(ob, 0.30, 0.70); // Std: 30–70% (CE ±20%)
-      else                  zone = this.entryZone(ob, 0.20, 0.50); // Precision: 20–50% mean fill
+      const zone = this.entryZone(ob, 0.20, 0.50); // 20–50% from OB low (bullish entry side)
       inOBZone = price >= zone.low && price <= zone.high;
     }
-    if (fvg) inFVGZone = price >= fvg.low && price <= fvg.high;
+    if (fvg) {
+      const fvgSize = fvg.high - fvg.low;
+      inFVGZone = price >= (fvg.low + fvgSize * 0.20) && price <= (fvg.low + fvgSize * 0.50);
+    }
 
     // ── STEP 4: M5 FVG/OB confluence with M1 entry ──
     const m5fvg = this.m5BullishFVG();
@@ -2200,23 +2217,19 @@ const strategy = {
     const inKZ        = this.inKillZone();     // kill zone = score bonus only, not a hard gate
 
     // ── SIGNAL GATE ──
-    // Requires: valid M1 BMS + in zone + session + M5 HTF alignment (or strong M5 CT score)
-    // STRONG SETUP BYPASS: score >= 14 + M1 confirms + P/D aligned + liquidity OK
-    //   allows trades when M5 is ranging/choppy but M1 shows clear displacement
+    // ALL setups require: valid M1 BMS + price IN zone (20-50% from OB/FVG entry side)
+    //   + above sweep. Price-in-zone is NEVER bypassed — this ensures the entry price
+    //   equals current market price at the OB/FVG level, keeping SL distances tight.
+    // HTF gate: standard setups need M5 alignment; A+ (score>=14) allow bypass only when
+    //   P/D is aligned and liquidity is clean.
     const htfOk  = htf.htfGateOk;
-    // m5Conflict: M1 confirmation (htf.m5Bias) is bearish while M5 HTF (htf.m15Aligned) is unaligned
     const m5Conflict = htf.m5Bias === 'bear' && !htf.m15Aligned;
 
-    // ── SIGNAL GATE ──
-    // ALL setups: require valid M1 BMS + above sweep
-    // Good (score>=9) & A+ (score>=14): inZone is relaxed — price may have moved
-    //   through the zone already; BMS + sweep direction is sufficient structure
-    // Standard setups: still require zone entry + HTF alignment + no M1 conflict
-    const isGoodSetup = score >= 9;
     const isAPlusSetup = score >= 14;
-    const zoneOk = inZone || isGoodSetup; // Good/A+ don't need strict zone entry
+    // zoneOk: ALWAYS require price in zone — no score-based bypass
+    const zoneOk = inZone;
     const signal = bmsOk && zoneOk && aboveSweep &&
-                   (isGoodSetup || isAPlusSetup || (inSession && htfOk && !m5Conflict));
+                   (isAPlusSetup || (inSession && htfOk && !m5Conflict));
 
     const quality = score >= 14 ? 3 : score >= 9 ? 2 : 1;
 
@@ -2255,16 +2268,18 @@ const strategy = {
     // ── STEP 2: M5 structural gate (pass M1 score for strong-setup bypass) ──
     const htf = this.htfConflCheck('DOWN', score);
 
-    // ── STEP 3: M1 entry zone check (20–50% OB/FVG mean threshold fills) ──
+    // ── STEP 3: M1 entry zone — price must be 20–50% INTO OB/FVG from the entry side ──
+    // For bearish: OB top is the entry side. 20-50% from top = ob.low+50% to ob.low+80%.
+    // No score bypass — price MUST be in zone to enter (prevents wide-SL entries far from zone).
     let inOBZone = false, inFVGZone = false;
     if (ob) {
-      let zone;
-      if      (score >= 9)  zone = this.entryZone(ob, 0.20, 0.80); // HQ: full CE band
-      else if (score >= 6)  zone = this.entryZone(ob, 0.30, 0.70); // Std: 30–70% (CE ±20%)
-      else                  zone = this.entryZone(ob, 0.50, 0.80); // Precision: upper 20–50% fill
+      const zone = this.entryZone(ob, 0.50, 0.80); // 20–50% from OB high (bearish entry side)
       inOBZone = price >= zone.low && price <= zone.high;
     }
-    if (fvg) inFVGZone = price >= fvg.low && price <= fvg.high;
+    if (fvg) {
+      const fvgSize = fvg.high - fvg.low;
+      inFVGZone = price >= (fvg.low + fvgSize * 0.50) && price <= (fvg.low + fvgSize * 0.80);
+    }
 
     // ── STEP 4: M5 FVG/OB confluence with M1 entry ──
     const m5fvg = this.m5BearishFVG();
@@ -2281,18 +2296,17 @@ const strategy = {
     const inKZ        = this.inKillZone();     // kill zone = score bonus only, not a hard gate
 
     // ── SIGNAL GATE ──
+    // ALL setups require: valid M1 BMS + price IN zone (20-50% from OB/FVG entry side)
+    //   + below sweep. Price-in-zone is NEVER bypassed — entry always at current market price
+    //   inside the zone, keeping SL distances tight.
     const htfOk     = htf.htfGateOk;
     const m5Conflict = htf.m5Bias === 'bull' && !htf.m15Aligned;
 
-    // ALL setups: require valid M1 BMS + below sweep
-    // Good (score>=9) & A+ (score>=14): inZone is relaxed — price may have moved
-    //   through the zone already; BMS + sweep direction is sufficient structure
-    // Standard setups: still require zone entry + HTF alignment + no M1 conflict
-    const isGoodSetup = score >= 9;
     const isAPlusSetup = score >= 14;
-    const zoneOk = inZone || isGoodSetup; // Good/A+ don't need strict zone entry
+    // zoneOk: ALWAYS require price in zone — no score-based bypass
+    const zoneOk = inZone;
     const signal = bmsOk && zoneOk && belowSweep &&
-                   (isGoodSetup || isAPlusSetup || (inSession && htfOk && !m5Conflict));
+                   (isAPlusSetup || (inSession && htfOk && !m5Conflict));
 
     const quality = score >= 14 ? 3 : score >= 9 ? 2 : 1;
 
@@ -2551,6 +2565,100 @@ function drawChart(overridePositions = null, overrideMid = null) {
   }
   markOBCandle(strategy.bullishOBCandle2(), '#00d4aa');
   markOBCandle(strategy.bearishOBCandle2(), '#ff4455');
+
+  // ── BMS / MSS / LQ SWEEP STRUCTURE MARKERS ──
+  // Draws 1px horizontal lines + small tags for each structural event the bot detects.
+  // LQ sweep uses dashed lines; BMS and MSS use solid lines.
+  (function drawStructureMarkers() {
+    const bullBMS = strategy.bullishBMS();
+    const bearBMS = strategy.bearishBMS();
+
+    // Helper: draw a 1px horizontal structural line across chart with a small tag
+    function structLine(price, color, tag, dashed, side) {
+      if (!price || price < minP || price > maxP) return;
+      const y = toY(price);
+      if (y < PAD.t || y > PAD.t + cH) return;
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+      if (dashed) ctx.setLineDash([4, 4]);
+      else        ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(PAD.l, y);
+      ctx.lineTo(PAD.l + CANDLE_AREA_W, y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Tag pill
+      ctx.font = 'bold 7px "Space Mono"';
+      const tagW = ctx.measureText(tag).width + 6;
+      const tagX = side === 'right'
+        ? PAD.l + CANDLE_AREA_W - tagW - 2
+        : PAD.l + 2;
+      const tagY = y - 2;
+      ctx.fillStyle = 'rgba(6,6,8,0.88)';
+      ctx.beginPath();
+      ctx.roundRect(tagX, tagY - 8, tagW, 11, 2);
+      ctx.fill();
+      ctx.fillStyle = color;
+      ctx.textAlign = 'left';
+      ctx.fillText(tag, tagX + 3, tagY);
+      ctx.restore();
+    }
+
+    // Helper: draw a small vertical tick at a candle's X position
+    function structTick(epochVal, color, atHigh) {
+      if (!epochVal) return;
+      const idx = vis.findIndex(c => c.epoch === epochVal);
+      if (idx === -1) return;
+      const x = PAD.l + (idx + 0.5) * slotW + (CANDLE_AREA_W - totalSlots * slotW);
+      if (x < PAD.l || x > PAD.l + CANDLE_AREA_W) return;
+      const bar = vis[idx];
+      const y = atHigh ? toY(bar.high) - 6 : toY(bar.low) + 6;
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x - 3, y);
+      ctx.lineTo(x + 3, y);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // ── BULLISH STRUCTURE ──
+    if (bullBMS && bullBMS.valid) {
+      // LQ sweep — dashed line at the swept swing low level (where liquidity was grabbed)
+      if (bullBMS.sweepLow !== undefined) {
+        structLine(bullBMS.sweepLow, 'rgba(0,212,170,0.70)', 'LQ', true, 'right');
+        structTick(bullBMS.sweepEpoch, 'rgba(0,212,170,0.80)', false);
+      }
+      // BMS — solid line at the ob high (level that was broken to confirm BMS)
+      if (bullBMS.ob) {
+        structLine(bullBMS.ob.high, 'rgba(0,212,170,0.55)', 'BMS', false, 'left');
+      }
+      // MSS — solid line at the bmsCandle high (the displacement candle that shifted structure)
+      if (bullBMS.bmsCandle) {
+        structLine(bullBMS.bmsCandle.high, 'rgba(68,255,180,0.70)', 'MSS', false, 'right');
+      }
+    }
+
+    // ── BEARISH STRUCTURE ──
+    if (bearBMS && bearBMS.valid) {
+      // LQ sweep — dashed line at the swept swing high level
+      if (bearBMS.sweepHigh !== undefined) {
+        structLine(bearBMS.sweepHigh, 'rgba(255,68,85,0.70)', 'LQ', true, 'right');
+        structTick(bearBMS.sweepEpoch, 'rgba(255,68,85,0.80)', true);
+      }
+      // BMS — solid line at the ob low (level broken to confirm BMS)
+      if (bearBMS.ob) {
+        structLine(bearBMS.ob.low, 'rgba(255,68,85,0.55)', 'BMS', false, 'left');
+      }
+      // MSS — solid line at the bmsCandle low (displacement that shifted structure)
+      if (bearBMS.bmsCandle) {
+        structLine(bearBMS.bmsCandle.low, 'rgba(255,120,130,0.70)', 'MSS', false, 'right');
+      }
+    }
+  })();
 
   // TRADE LINES
   const MT5C = { buy: '#26a69a', sell: '#ef5350', sl: '#ff9800', tp: '#26a69a' };
@@ -4029,6 +4137,11 @@ function _handleDerivMsg(msg) {
   if (msg.msg_type === 'candles' && msg.candles) {
     const gran = msg.echo_req && +msg.echo_req.granularity;
     if (!gran || !candles[gran]) return;
+    // Guard: do not overwrite the live candles[] while a BT fetch owns the
+    // WebSocket channel — the BT WebSockets are separate connections but the
+    // Deriv live connection can still push a historical batch (from the onopen
+    // _derivRequestHistory calls) during a concurrent backtest fetch.
+    if (btFetching) return;
     const arr = msg.candles.map(c => ({
       epoch: +c.epoch,
       open : +c.open,
@@ -4242,7 +4355,7 @@ function runStrategy() {
     if (!bs.conds.bBMS) reasons.push('no BMS');
     if (bs.conds.bBMS) {
       if (!bs.conds.bHL) {
-        const inZone = (bs.ob || bs.fvg) ? 'price outside OB/FVG zone' : 'no OB/FVG zone found';
+        const inZone = (bs.ob || bs.fvg) ? 'price not 20-50% into OB/FVG zone' : 'no OB/FVG zone found';
         reasons.push(inZone);
       }
     }
@@ -4259,7 +4372,7 @@ function runStrategy() {
     if (!ss.conds.sBMS) reasons.push('no BMS');
     if (ss.conds.sBMS) {
       if (!ss.conds.sLH) {
-        const inZone = (ss.ob || ss.fvg) ? 'price outside OB/FVG zone' : 'no OB/FVG zone found';
+        const inZone = (ss.ob || ss.fvg) ? 'price not 20-50% into OB/FVG zone' : 'no OB/FVG zone found';
         reasons.push(inZone);
       }
     }
@@ -4548,6 +4661,18 @@ const replay = {
     if (!this.active) return;
     this._processCandle(true);
     this.index++;
+
+    // ── Profit target early-exit ─────────────────────────────────────────────
+    // Stop the replay as soon as the balance gain meets or exceeds the target.
+    // Previously this value was only recorded in results but never enforced.
+    if (this.replayProfitTarget > 0 &&
+        (this.replayBal - this.replayStartBal) >= this.replayProfitTarget) {
+      addSignal('info',
+        `[BT] Profit target $${this.replayProfitTarget.toFixed(2)} reached — stopping replay early`, null);
+      this._finish();
+      return;
+    }
+
     const pct = ((this.index - 100) / (this.data.length - 100)) * 100;
     const spd = `${this.speed}×`;
     setBtProgress(Math.min(99, 40 + pct * 0.57),
@@ -5104,13 +5229,22 @@ function btCheckReady() {
 
 async function fetchBtCandles(granularity, startEpoch, endEpoch, onProgress) {
   // Fetches historical OHLC candles from Deriv ticks_history API for backtest.
-  // Deriv returns up to 5000 candles per request; paginates automatically.
+  // Paginates backwards from endEpoch until startEpoch is covered.
+  //
+  // KEY DESIGN: each page request sends ONLY `end` (no `start`), so Deriv always
+  // returns the most recent `count` candles before the cursor regardless of how
+  // many candles fall in the sub-range.  Sending `start` alongside `count` caused
+  // Deriv to silently cap results to the number of bars between start and end —
+  // making the old `chunk.length < 5000` guard fire after the very first page even
+  // for multi-week date ranges, leaving the backtest with ≤ one page of data.
   const all = [];
   let cursor = endEpoch;
   let reqCount = 0;
+  const MAX_PAGES = 200; // hard safety cap (~200 × 5000 M1 bars ≈ 9 months)
   btFetching = true;
 
-  const fetchPage = (start, end, gran) => new Promise((resolve, reject) => {
+  // Fetch one page ending at `end`.  No `start` param — filter client-side.
+  const fetchPage = (end, gran) => new Promise((resolve, reject) => {
     let ws;
     try { ws = new WebSocket(DERIV_WS_URL); }
     catch(e) { reject(e); return; }
@@ -5122,7 +5256,6 @@ async function fetchBtCandles(granularity, startEpoch, endEpoch, onProgress) {
       ws.send(JSON.stringify({
         ticks_history   : DERIV_SYMBOL,
         adjust_start_time: 1,
-        start           : start,
         end             : end,
         count           : 5000,
         granularity     : gran,
@@ -5147,17 +5280,17 @@ async function fetchBtCandles(granularity, startEpoch, endEpoch, onProgress) {
   });
 
   try {
-    while (cursor > startEpoch && !btCancelled) {
+    while (cursor > startEpoch && !btCancelled && reqCount < MAX_PAGES) {
       let chunk;
       try {
-        chunk = await fetchPage(startEpoch, cursor, granularity);
+        chunk = await fetchPage(cursor, granularity);
       } catch(e) {
         addSignal('warn', `BT data fetch error: ${e.message}`, null);
         break;
       }
       if (!chunk || !chunk.length) break;
 
-      // Merge into all[], filtering to requested date range
+      // Filter to the requested date range and accumulate
       for (const bar of chunk) {
         if (bar.epoch >= startEpoch && bar.epoch <= endEpoch) all.push(bar);
       }
@@ -5165,10 +5298,14 @@ async function fetchBtCandles(granularity, startEpoch, endEpoch, onProgress) {
       reqCount++;
       if (onProgress) onProgress(reqCount, chunk.length);
 
-      // Fewer than 5000 bars = reached start of available history
-      if (chunk.length < 5000) break;
+      // Stop when the earliest bar in this page is at or before startEpoch —
+      // we've now covered the full requested window.
+      if (chunk[0].epoch <= startEpoch) break;
 
-      // Move cursor back before the earliest bar received
+      // If fewer than ~10 bars came back the API has no more historical data.
+      if (chunk.length < 10) break;
+
+      // Move cursor back before the earliest bar in this chunk and fetch the next page.
       cursor = chunk[0].epoch - granularity;
       if (cursor <= startEpoch) break;
       await new Promise(r => setTimeout(r, 400)); // polite rate limit
